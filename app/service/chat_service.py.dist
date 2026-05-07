@@ -1,0 +1,187 @@
+import json
+from langchain_core.messages import HumanMessage
+from app.core.agent_logic import get_welltrack_agent
+from langchain_groq import ChatGroq
+from app.core.config import settings
+
+from pydantic import BaseModel, Field
+from typing import Optional
+import re
+from app.core.agent_logic import get_welltrack_agent
+
+memory_store = {}
+
+# Modelo para validar la extracción
+class UserProfile(BaseModel):
+    nombre: Optional[str] = Field(None, description="Nombre del usuario")
+    edad: Optional[int] = Field(None, description="Edad del usuario")
+    objetivo: Optional[str] = Field(None, description="Objetivo de salud")
+
+async def extraer_datos_estructurados(conversation_history):
+    """
+    Analiza el historial de chat y extrae los datos en formato JSON.
+    """
+    llm = ChatGroq(
+        api_key=settings.groq_api_key, 
+        model_name="llama-3.3-70b-versatile", 
+        temperature=0
+    )
+    
+    # Prompt de extracción (separado de la charla principal)
+    prompt = f"""
+    Analiza el siguiente historial de chat y extrae la información del usuario.
+    Si un dato no ha sido mencionado explícitamente, usa null.
+    
+    Formatos admitidos para objetivo: "perder peso", "ganar músculo", "mejorar resistencia".
+    
+    Historial:
+    {conversation_history}
+    
+    Responde estrictamente en formato JSON con estas llaves: "nombre", "edad", "objetivo".
+    """
+    
+    try:
+        response = llm.invoke(prompt)
+        # Limpiamos la respuesta por si el LLM añade texto extra
+        content = response.content.strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+            
+        data = json.loads(content)
+        return UserProfile(**data)
+    except Exception as e:
+        print(f"Error en extracción: {e}")
+        return UserProfile(nombre=None, edad=None, objetivo=None)
+
+async def process_chat_message(session_id: str, message: str):
+    agent_chain = get_welltrack_agent(session_id, memory_store)
+        
+    # Respuesta del agente
+    response = agent_chain.invoke({"input": message, "history": memory_store[session_id].load_memory_variables({})["history"]})
+    memory_store[session_id].save_context({"input": message}, {"output": response.content})
+    
+    history_messages = memory_store[session_id].load_memory_variables({})["history"]
+    full_conversation = "\n".join([f"{'Usuario' if isinstance(m, HumanMessage) else 'Agente'}: {m.content}" for m in history_messages])
+    
+    # Llamamos a la lógica de extracción
+    is_final, summary = await check_if_flow_completed(full_conversation)
+    
+    return {
+        "response": response.content,
+        "is_final": is_final,
+        "summary": summary
+    }
+
+async def check_if_flow_completed(conversation_text: str):
+    """
+    Usa el LLM para extraer datos estructurados. 
+    Si los 3 campos están presentes, finaliza.
+    """
+    llm = ChatGroq(api_key=settings.groq_api_key, model_name=settings.model_name, temperature=0)
+    
+    extraction_prompt = f"""
+    Analiza la siguiente conversación y extrae información en formato JSON.
+    Campos requeridos: "name" (string), "age" (int), "goal" (string).
+    El "goal" debe ser uno de estos: perder peso, ganar músculo, mejorar resistencia.
+    Si falta algún dato, ponlo como null.
+    
+    Conversación:
+    {conversation_text}
+    
+    Responde ÚNICAMENTE el JSON.
+    """
+    
+    res = llm.invoke(extraction_prompt)
+    try:
+        data = json.loads(res.content)
+        # Si no hay nulos, hemos terminado
+        if all(data.values()):
+            return True, data
+    except:
+        pass
+        
+    return False, None
+
+
+# Función helper para extraer valores (asegúrate de que esté definida o impórtala)
+def extraer_valor(texto, campo):
+    texto_lower = texto.lower()
+
+    if campo == "nombre":
+        # 1. Intentamos el patrón clásico (Me llamo X, Soy X)
+        match = re.search(r"(me llamo|soy|nombre es|nombre)\s+([a-zñáéíóú]+)", texto_lower)
+        if match:
+            valor = match.group(2).capitalize()
+            if valor.lower() not in ["viky", "asistente viky", "viky-1.0"]:
+                return valor
+
+        # 2. Si no hay patrón, buscamos la respuesta a la pregunta de la IA
+        lineas = texto.split('\n')
+        for i in range(len(lineas)-1, 0, -1):
+            if "cuál es tu nombre" in lineas[i-1].lower() or "tu nombre por favor" in lineas[i-1].lower():
+                posible_nombre = lineas[i].replace("Human:", "").strip()
+                if len(posible_nombre.split()) == 1: # Si es solo una palabra
+                    return posible_nombre.capitalize()
+        return None
+    
+    if campo == "edad":
+        match = re.search(r"(\d+)\s*(años|de edad)", texto_lower)
+        return int(match.group(1)) if match else None
+    
+    if campo == "objetivo":
+        if any(kw in texto_lower for kw in ["perder", "bajar", "adelgazar", "peso"]): return "perder peso"
+        if any(kw in texto_lower for kw in ["ganar", "músculo", "masa", "hipertrofia"]): return "ganar músculo"
+        if any(kw in texto_lower for kw in ["resistencia", "condición", "stamina"]): return "mejorar resistencia"
+        return None
+    
+    return None
+
+async def process_chat_message_new(session_id: str, message: str, memory_store: dict):
+    # 1. Ejecutar el agente de Viky
+    agent_chain = get_welltrack_agent(session_id, memory_store)
+
+    # Respuesta del agente
+    response = agent_chain.invoke(
+        {"input": message, "history": memory_store[session_id].load_memory_variables({})["history"]}
+    )
+    memory_store[session_id].save_context({"input": message}, {"output": response.content})
+    response_text = response.content
+
+    # 2. Extraer historial de forma ultra-segura
+    memory_obj = memory_store[session_id]
+    variables = memory_obj.load_memory_variables({})
+    
+    # Aquí es donde fallaba: history_data puede ser String o Lista
+    history_data = variables.get("history", "")
+    
+    if isinstance(history_data, list):
+        # Si es lista de mensajes, extraemos el contenido de cada uno
+        buffer = " ".join([getattr(m, 'content', str(m)) for m in history_data])
+    else:
+        buffer = str(history_data)
+
+    # 3. EXTRAER VALORES
+    nombre = extraer_valor(buffer, "nombre")
+    edad = extraer_valor(buffer, "edad")
+    objetivo = extraer_valor(buffer, "objetivo")
+
+    # 4. PRINTS DE DEBUG (Asegúrate de mirar la consola donde corre uvicorn)
+    print("\n" + "="*40)
+    print(f"DEBUG VIKY - SESIÓN: {session_id}")
+    print(f"MENSAJE USUARIO: {message}")
+    print(f"EXTRACCIÓN -> Nombre: {nombre} | Edad: {edad} | Objetivo: {objetivo}")
+    
+    # Comprobar si tenemos los 3 para marcar final
+    finalizado = all(v is not None for v in [nombre, edad, objetivo])
+    print(f"ESTADO FINALIZADO: {finalizado}")
+    print("="*40 + "\n")
+
+    return {
+        "response": response_text,
+        "is_final": finalizado,
+        "summary": {
+            "name": nombre,  # Cambiar 'nombre' por 'name' si así está en tu Pydantic
+            "age": edad,     # Cambiar 'edad' por 'age'
+            "goal": objetivo  # Cambiar 'objetivo' por 'goal'
+        } if finalizado else None
+    }  

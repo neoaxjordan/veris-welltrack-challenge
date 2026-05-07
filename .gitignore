@@ -1,0 +1,19 @@
+# Java
+target/
+*.class
+.mvn/
+.idea/
+
+# Node
+node_modules/
+dist/
+.env
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+venv/
+
+### VS Code ###
+.vscode/
